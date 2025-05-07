@@ -155,14 +155,17 @@ where
         })
     }
 
-    /// compute anomaly score for an item
+    /// Compute anomaly score for an item, with a recursion cap (default: 2x max_tree_depth)
     pub fn score(&self, values: &[T; N]) -> f64 {
-        let path_length: f64 = self.trees.iter().map(|tree| tree.path_length(values)).sum();
+        // Use a conservative cap: 2x the average tree depth
+        let default_cap = (self.avg_path_length_c.ceil() as usize) * 2;
+        self.score_with_recursion_cap(values, default_cap)
+    }
 
-        // Average of path length travelled by the point in all trees.
+    /// Compute anomaly score for an item, with explicit recursion cap
+    pub fn score_with_recursion_cap(&self, values: &[T; N], max_depth: usize) -> f64 {
+        let path_length: f64 = self.trees.iter().map(|tree| tree.path_length_with_cap(values, max_depth)).sum();
         let eh = path_length / self.trees.len() as f64;
-
-        // Anomaly Score
         2.0_f64.powf(-eh / self.avg_path_length_c)
     }
 }
@@ -218,16 +221,24 @@ where
         }
     }
 
-    /// length of the path traversed by the point on the tree when it reaches an external node.
-    pub fn path_length(&self, values: &[T; N]) -> f64 {
-        path_length_recurse(&self.root, values)
+    pub fn path_length_with_cap(&self, values: &[T; N], max_depth: usize) -> f64 {
+        path_length_recurse(&self.root, values, 0, max_depth)
     }
 }
 
-fn path_length_recurse<T, const N: usize>(node: &Node<T, N>, values: &[T; N]) -> f64
+fn path_length_recurse<T, const N: usize>(
+    node: &Node<T, N>,
+    values: &[T; N],
+    depth: usize,
+    max_depth: usize,
+) -> f64
 where
     T: Float,
 {
+    if depth >= max_depth {
+        // Cap reached: treat as external node with 1 sample (shortest possible path)
+        return 0.0;
+    }
     match node {
         Node::Ex(ex_node) => {
             if ex_node.num_samples <= 1 {
@@ -243,6 +254,8 @@ where
                     Direction::Right => in_node.right.as_ref(),
                 },
                 values,
+                depth + 1,
+                max_depth,
             )
         }
     }
@@ -291,16 +304,17 @@ where
             p
         };
 
-        // randomly select a normal vector ~n ∈ IR |samples| by drawing each coordinate
-        // of ~n from a standard Gaussian distribution.
-        let mut n = [T::zero(); N];
-        (0..N)
-            .zip(n.iter_mut())
-            .for_each(|(_, n_i)| *n_i = rng.sample(StandardNormal));
+        // Efficiently generate a sparse random normal vector. Only
+        // `active_dims = extension_level + 1` coordinates receive a non-zero
+        // component; the rest are guaranteed to be 0.  For high-dimensional
+        // data this avoids sampling N Gaussian numbers at every node.
 
-        // set coordinates of ~n to zero according to extension level
-        for idx in (0..N).choose_multiple(rng, N - extension_level - 1) {
-            n[idx] = T::zero();
+        let mut n = [T::zero(); N];
+        let active_dims = extension_level + 1; // must be ≤ N
+
+        // Choose the active dimensions uniformly without replacement.
+        for idx in (0..N).choose_multiple(rng, active_dims) {
+            n[idx] = rng.sample(StandardNormal);
         }
 
         let mut samples_left = vec![];
